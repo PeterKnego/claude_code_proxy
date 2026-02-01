@@ -10,6 +10,7 @@ set -euo pipefail
 PROXY_HOST="127.0.0.1"  # Localhost - proxy only accessible from this machine
 PROXY_PORT="9090"       # Port where mitmproxy intercepts traffic
 WEB_PORT="9091"         # Port for mitmweb UI (browser interface)
+LAUNCH_WEB_UI=1         # Automatically open browser to mitmweb UI (1=yes, 0=no)
 DEBUG=${DEBUG:-0}       # Show mitmweb output (set DEBUG=1 in environment)
 
 # --- Utility Functions ---
@@ -139,6 +140,7 @@ if (( DEBUG )); then
       --set connection_strategy=lazy \
       --set http2=false \
       --set upstream_http2=false \
+      --set web_password= \
       -p "${PROXY_PORT}" --web-port "${WEB_PORT}" --listen-host "${PROXY_HOST}" &
 else
   # Normal mode: suppress mitmweb output
@@ -147,6 +149,7 @@ else
       --set connection_strategy=lazy \
       --set http2=false \
       --set upstream_http2=false \
+      --set web_password= \
       -p "${PROXY_PORT}" --web-port "${WEB_PORT}" --listen-host "${PROXY_HOST}" >/dev/null 2>&1 &
 fi
 
@@ -165,6 +168,9 @@ if ! kill -0 "$MITMWEB_PID" 2>/dev/null; then
   log "Error: mitmweb failed to start (process exited)"
   exit 1
 fi
+
+log "Web UI available at http://${PROXY_HOST}:${WEB_PORT}"
+
 
 # --- Configure Proxy Environment for Claude ---
 
@@ -188,7 +194,7 @@ if [[ -f "$MITM_CA" ]]; then
   # Check if certificate is expired before using it
   check_cert_expiration "$MITM_CA"
 
-  export NODE_EXTRA_CA_CERTS="$MITM_CA"    # Node.js & Claude Code (which runs on Node.js)
+  export NODE_EXTRA_CA_CERTS="$MITM_CA"    # Node.js
   export SSL_CERT_FILE="$MITM_CA"          # OpenSSL/curl
   export REQUESTS_CA_BUNDLE="$MITM_CA"     # Python requests library
   export CURL_CA_BUNDLE="$MITM_CA"         # curl (alternative)
