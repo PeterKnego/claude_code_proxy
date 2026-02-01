@@ -1,0 +1,217 @@
+#!/usr/bin/env zsh
+# claudep - Claude CLI wrapper with mitmproxy for HTTP/HTTPS traffic inspection
+# This script starts mitmweb as a proxy, configures environment variables,
+# and launches Claude CLI with all traffic routed through the proxy.
+
+# Exit on error, undefined variables, and pipe failures
+set -euo pipefail
+
+# --- Configuration ---
+PROXY_HOST="127.0.0.1"  # Localhost - proxy only accessible from this machine
+PROXY_PORT="9090"       # Port where mitmproxy intercepts traffic
+WEB_PORT="9091"         # Port for mitmweb UI (browser interface)
+DEBUG=${DEBUG:-0}       # Show mitmweb output (set DEBUG=1 in environment)
+
+# --- Utility Functions ---
+
+# Print timestamped log messages
+log() { print -r -- "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+
+# Check if a required command exists, exit with error if missing
+need_cmd() { command -v "$1" >/dev/null 2>&1 || { print -r -- "Missing: $1" >&2; exit 127; }; }
+
+# Check if a port is available (not in use)
+# Exits with error if port is already occupied
+check_port_free() {
+  local port=$1
+  # nc -z tests if port is open without sending data
+  if nc -z "$PROXY_HOST" "$port" 2>/dev/null; then
+    log "Error: Port $port already in use"
+    exit 1
+  fi
+}
+
+# Wait for a port to start listening (port becomes available)
+# Args: port, timeout_seconds (default: 5)
+# Returns: 0 if port opened, 1 if timeout
+wait_for_port() {
+  local port=$1 timeout=${2:-5}
+  # Poll every 0.1s for up to timeout seconds
+  for ((i=0; i<timeout*10; i++)); do
+    nc -z "$PROXY_HOST" "$port" 2>/dev/null && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+# Check if a PEM certificate is expired
+# Args: cert_path
+# Exits with error if certificate is expired
+check_cert_expiration() {
+  local cert_path=$1
+
+  # Get certificate expiration date in seconds since epoch
+  local expiry_date
+  expiry_date=$(openssl x509 -enddate -noout -in "$cert_path" 2>/dev/null | cut -d= -f2)
+
+  if [[ -z "$expiry_date" ]]; then
+    log "Warning: Could not parse certificate expiration date"
+    return 0
+  fi
+
+  # Convert to epoch seconds (works on both macOS and Linux)
+  local expiry_epoch
+  if date -j -f "%b %d %T %Y %Z" "$expiry_date" "+%s" >/dev/null 2>&1; then
+    # macOS date format
+    expiry_epoch=$(date -j -f "%b %d %T %Y %Z" "$expiry_date" "+%s" 2>/dev/null)
+  else
+    # GNU date format
+    expiry_epoch=$(date -d "$expiry_date" "+%s" 2>/dev/null)
+  fi
+
+  local current_epoch=$(date "+%s")
+
+  if (( expiry_epoch <= current_epoch )); then
+    log "Error: mitmproxy CA certificate has expired!"
+    log ""
+    log "To regenerate the certificate:"
+    log "  1. Remove the old certificates:"
+    log "     rm -rf ~/.mitmproxy"
+    log ""
+    log "  2. Start mitmweb to generate new certificates:"
+    log "     mitmweb"
+    log ""
+    log "  3. Press Ctrl+C to stop mitmweb after certificates are generated"
+    log ""
+    log "  4. Re-run this script"
+    exit 1
+  fi
+}
+
+# --- Cleanup Handler ---
+
+MITMWEB_PID=""  # Stores the background mitmweb process ID
+
+# Cleanup function: gracefully stops mitmweb when script exits
+# Called automatically via trap on EXIT, INT (Ctrl+C), or TERM signals
+cleanup() {
+  [[ -z "${MITMWEB_PID}" ]] && return  # No process to clean up
+  log "Stopping mitmweb (pid ${MITMWEB_PID})..."
+
+  # Try graceful shutdown with SIGTERM
+  kill "${MITMWEB_PID}" 2>/dev/null || true
+
+  # Wait up to 3 seconds for graceful shutdown
+  for ((i=0; i<30; i++)); do
+    # kill -0 checks if process exists without sending signal
+    kill -0 "${MITMWEB_PID}" 2>/dev/null || return 0
+    sleep 0.1
+  done
+
+  # Force kill if still running after timeout
+  kill -9 "${MITMWEB_PID}" 2>/dev/null || true
+}
+
+# Register cleanup to run on script exit, interrupt (Ctrl+C), or termination
+trap cleanup EXIT INT TERM
+
+# --- Startup Checks ---
+
+# Verify all required commands are installed
+need_cmd mitmweb  # The MITM proxy with web UI
+need_cmd claude   # Claude CLI
+need_cmd nc       # Netcat for port checking
+
+# Ensure ports are free before starting services
+check_port_free "$PROXY_PORT"
+check_port_free "$WEB_PORT"
+
+# --- Start mitmweb Proxy ---
+
+log "Starting mitmweb (proxy ${PROXY_HOST}:${PROXY_PORT}, UI ${PROXY_HOST}:${WEB_PORT})..."
+
+# Start mitmweb in background
+# Note: mitmweb includes both proxy and web UI; don't run mitmproxy separately
+if (( DEBUG )); then
+  # Debug mode: show mitmweb output
+  env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
+    mitmweb --mode regular \
+      --set connection_strategy=lazy \
+      --set http2=false \
+      --set upstream_http2=false \
+      -p "${PROXY_PORT}" --web-port "${WEB_PORT}" --listen-host "${PROXY_HOST}" &
+else
+  # Normal mode: suppress mitmweb output
+  env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
+    mitmweb --mode regular \
+      --set connection_strategy=lazy \
+      --set http2=false \
+      --set upstream_http2=false \
+      -p "${PROXY_PORT}" --web-port "${WEB_PORT}" --listen-host "${PROXY_HOST}" >/dev/null 2>&1 &
+fi
+
+# Save the background process ID for cleanup
+MITMWEB_PID=$!
+# --- Verify mitmweb Started Successfully ---
+
+# Wait for proxy port to be ready (up to 5 seconds)
+if ! wait_for_port "$PROXY_PORT" 5; then
+  log "Error: mitmweb failed to start (port $PROXY_PORT not listening after 5s)"
+  exit 1
+fi
+
+# Double-check the mitmweb process is still alive
+if ! kill -0 "$MITMWEB_PID" 2>/dev/null; then
+  log "Error: mitmweb failed to start (process exited)"
+  exit 1
+fi
+
+# --- Configure Proxy Environment for Claude ---
+
+# Set proxy environment variables to route all traffic through mitmproxy
+# Both uppercase and lowercase versions for maximum compatibility
+export HTTP_PROXY="http://${PROXY_HOST}:${PROXY_PORT}"
+export HTTPS_PROXY="http://${PROXY_HOST}:${PROXY_PORT}"
+export http_proxy="${HTTP_PROXY}"
+export https_proxy="${HTTPS_PROXY}"
+
+# Don't proxy localhost connections (avoid circular routing)
+export NO_PROXY="localhost,127.0.0.1,::1"
+export no_proxy="${NO_PROXY}"
+
+# --- Configure TLS Certificate Trust ---
+
+# Point various TLS libraries to mitmproxy's CA certificate
+# This allows interception of HTTPS traffic without certificate errors
+MITM_CA="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
+if [[ -f "$MITM_CA" ]]; then
+  # Check if certificate is expired before using it
+  check_cert_expiration "$MITM_CA"
+
+  export NODE_EXTRA_CA_CERTS="$MITM_CA"    # Node.js & Claude Code (which runs on Node.js)
+  export SSL_CERT_FILE="$MITM_CA"          # OpenSSL/curl
+  export REQUESTS_CA_BUNDLE="$MITM_CA"     # Python requests library
+  export CURL_CA_BUNDLE="$MITM_CA"         # curl (alternative)
+else
+  log "Warning: CA certificate not found at $MITM_CA"
+  log "         Run mitmweb once and trust the CA, or TLS interception won't work"
+fi
+
+# --- Launch Claude CLI ---
+
+log "Launching: claude $*"
+
+# Run Claude in the background to enable proper signal handling
+# This ensures cleanup() runs when Ctrl+C is pressed
+claude "$@" &
+CLAUDE_PID=$!
+
+# Wait for Claude to finish
+# Using 'wait' instead of running in foreground ensures that:
+# - Ctrl+C (SIGINT) properly triggers the cleanup trap
+# - mitmweb is always shut down gracefully when the script exits
+wait $CLAUDE_PID
+CLAUDE_EXIT=$?
+
+# Exit with Claude's exit code (cleanup runs automatically via EXIT trap)
+exit $CLAUDE_EXIT
